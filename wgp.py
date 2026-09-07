@@ -7515,7 +7515,11 @@ def generate_media(
             return_latent_slice = None 
             frames_relative_positions_list = []
             tail_trim_frames = discard_last_frames + automatic_trim_last_frames
-            if reuse_frames > 0:
+            h3_latent_overlap = str(model_def.get("architecture", "")).startswith("minimax_h3_")
+            if h3_latent_overlap and next_overlap_frames > 0 and tail_trim_frames == 0:
+                h3_overlap_latents = 1 + ((next_overlap_frames - 1) // 17) * 5
+                return_latent_slice = slice(-h3_overlap_latents, None)
+            elif not h3_latent_overlap and reuse_frames > 0:
                 tail_trim_latents = tail_trim_frames // latent_size
                 return_latent_slice = slice(- max(1, (reuse_frames + tail_trim_frames) // latent_size), None if tail_trim_latents == 0 else -tail_trim_latents)
             refresh_preview  = {"image_guide" : image_guide, "image_mask" : image_mask} if image_mode >= 1 else {}

@@ -64,6 +64,30 @@ def video_latent_frames(frame_count):
     return 2 + ((frame_count - 5) // 17) * 5
 
 
+def overlap_latent_frames(frame_count):
+    frame_count = int(frame_count or 0)
+    if frame_count <= 0:
+        return 0
+    return 1 + ((frame_count - 1) // 17) * 5
+
+
+def _select_overlap_latents(latents, frame_count, height, width):
+    expected_frames = overlap_latent_frames(frame_count)
+    if not torch.is_tensor(latents):
+        return None, "no latent overlap was provided"
+    if latents.ndim != 5:
+        return None, f"expected rank 5, got rank {latents.ndim}"
+    expected_shape = (1, 24, math.ceil(height / 16), math.ceil(width / 16))
+    actual_shape = (latents.shape[0], latents.shape[1], latents.shape[3], latents.shape[4])
+    if actual_shape != expected_shape:
+        return None, f"expected BCHW {expected_shape}, got {actual_shape}"
+    if frame_count < 1 or (frame_count - 1) % 17:
+        return None, f"unsupported {frame_count}-frame overlap"
+    if latents.shape[2] < expected_frames:
+        return None, f"expected at least {expected_frames} latent frames, got {latents.shape[2]}"
+    return latents[:, :, -expected_frames:].detach().to(device="cpu"), None
+
+
 def _as_video(tensor):
     if tensor is None:
         return None
@@ -565,6 +589,17 @@ class MiniMaxH3Pipeline:
         visual_latents.append(latent)
         keyframes.append({"anchor": "history", "latent_frame_count": latent.shape[2]})
 
+    @staticmethod
+    def _add_latent_continuation(latent, boundary_frame, presentation, visual_latents, keyframes):
+        if latent.shape[2] > 1:
+            history = latent[:, :, :-1]
+            visual_latents.append(history)
+            keyframes.append({"anchor": "history", "latent_frame_count": history.shape[2]})
+        boundary = latent[:, :, -1:]
+        presentation.append({"type": "image", "frames": _qwen_frames(boundary_frame.clone())})
+        visual_latents.append(boundary)
+        keyframes.append({"anchor": "first", "latent_frame_count": 1})
+
     def _add_audio_condition(self, latent, anchor, audio_latents, audio_keyframes):
         audio_latents.append(latent)
         audio_keyframes.append({"anchor": anchor, "latent_frame_count": latent.shape[-1]})
@@ -694,6 +729,8 @@ class MiniMaxH3Pipeline:
             frame_num = round(float(duration_seconds) * fps)
             height = width = 32
             guide_phases = 1
+        overlapped_latents = kwargs.get("overlapped_latents")
+        return_latent_slice = kwargs.get("return_latent_slice")
         frame_num = normalize_frame_count(int(frame_num), 5, 17, 5)
         audio_from_control_video = not self.reference_mode and "2" in (audio_prompt_type or "")
         prefix_frames_count, overlap_error = normalize_overlap(int(prefix_frames_count or 0), 17, 1)
@@ -787,9 +824,20 @@ class MiniMaxH3Pipeline:
                 return _crop_spatial_tile(source, tile_origin[0], tile_origin[1], stage_height, stage_width)
 
             if continuation_count:
-                if history_frames is not None:
-                    self._add_video_history(prepare_stage_video(history_frames), stage_latents, stage_keyframes)
-                self._add_image_condition(prepare_stage_video(continuation[:, -1:]), 0, stage_presentation, stage_latents, stage_keyframes)
+                overlap_latents, overlap_reason = _select_overlap_latents(
+                    overlapped_latents, continuation_count, stage_height, stage_width
+                )
+                if overlap_latents is not None:
+                    boundary_frame = prepare_stage_video(continuation[:, -1:])
+                    self._add_latent_continuation(
+                        overlap_latents, boundary_frame, stage_presentation, stage_latents, stage_keyframes
+                    )
+                    print(f"H3 latent continuation: using latent overlap {tuple(overlap_latents.shape)}")
+                else:
+                    if history_frames is not None:
+                        self._add_video_history(prepare_stage_video(history_frames), stage_latents, stage_keyframes)
+                    self._add_image_condition(prepare_stage_video(continuation[:, -1:]), 0, stage_presentation, stage_latents, stage_keyframes)
+                    print(f"H3 latent continuation: fallback to frame overlap ({overlap_reason})")
             elif image_start is not None and not audio_from_control_video:
                 self._add_image_condition(prepare_stage_video(image_start), 0, stage_presentation, stage_latents, stage_keyframes)
             if image_end is not None and not audio_from_control_video:
@@ -1440,6 +1488,13 @@ class MiniMaxH3Pipeline:
         self._check_abort()
         self._use_shared_components()
         context = payload = presentation = visual_latents = audio_latents = refs = keyframes = audio_keyframes = source_latents = source_noise = source_buffer = editable_mask = None
+        latent_slice = None
+        if return_latent_slice is not None and torch.is_tensor(video) and frozen_target_video is None:
+            latent_slice = video[:, :, return_latent_slice].detach().to(device="cpu")
+            if latent_slice.shape[2] == 0:
+                latent_slice = None
+            else:
+                print(f"H3 latent continuation: captured tail shape {tuple(latent_slice.shape)}")
         if not self.audio_only and decoded_video is None:
             if frozen_target_video is None:
                 video = video.to(self.vae._model_dtype)
@@ -1474,7 +1529,8 @@ class MiniMaxH3Pipeline:
         if self.audio_only:
             return {"x": torch.from_numpy(decoded_audio.T.copy()), "audio_sampling_rate": AUDIO_SAMPLE_RATE,
                     "overridden_inputs": {"resolution": "32x32", "video_length": frame_num, "duration_seconds": round(frame_num / fps, 3)}}
-        return {"x": decoded_video, "audio": decoded_audio, "audio_sampling_rate": AUDIO_SAMPLE_RATE}
+        return {"x": decoded_video, "audio": decoded_audio, "audio_sampling_rate": AUDIO_SAMPLE_RATE,
+                "latent_slice": latent_slice}
 
     def refine_video(self, video, *, prompt, strengths, denoising_strength=0.45, sampling_steps=4, shift=12.0,
                      seed=0, fps=24.0, sample_solver="euler", VAE_tile_size=None, audio_waveform=None,
